@@ -1,0 +1,172 @@
+From d13fd4ad270ff6ab6c895646c2b45d4752c5ff30 Mon Sep 17 00:00:00 2001
+From: Valentin Cocaud <v.cocaud@gmail.com>
+Date: Tue, 2 Sep 2025 15:30:16 +0200
+Subject: [PATCH] merge branch 13821/fix-block-cursor-terminal
+
+---
+ helix-term/src/compositor.rs            |  7 ++++
+ helix-term/src/ui/editor.rs             | 46 +++++++++++--------------
+ helix-term/tests/test/commands/write.rs |  2 +-
+ helix-term/tests/test/helpers.rs        |  3 +-
+ 4 files changed, 31 insertions(+), 27 deletions(-)
+
+diff --git a/helix-term/src/compositor.rs b/helix-term/src/compositor.rs
+index 28c8651a..46d66e8f 100644
+--- a/helix-term/src/compositor.rs
++++ b/helix-term/src/compositor.rs
+@@ -177,7 +177,14 @@ pub fn handle_event(&mut self, event: &Event, cx: &mut Context) -> bool {
+     }
+ 
+     pub fn render(&mut self, area: Rect, surface: &mut Surface, cx: &mut Context) {
++        // Check if there are prompt layers active and update EditorView
++        let has_prompt = self.has_component("helix_term::ui::prompt::Prompt");
++
+         for layer in &mut self.layers {
++            // Update prompt state for EditorView
++            if let Some(editor_view) = layer.as_any_mut().downcast_mut::<crate::ui::EditorView>() {
++                editor_view.prompt_active = has_prompt;
++            }
+             layer.render(area, surface, cx);
+         }
+     }
+diff --git a/helix-term/src/ui/editor.rs b/helix-term/src/ui/editor.rs
+index b25af107..ffa9150b 100644
+--- a/helix-term/src/ui/editor.rs
++++ b/helix-term/src/ui/editor.rs
+@@ -44,6 +44,8 @@ pub struct EditorView {
+     spinners: ProgressSpinners,
+     /// Tracks if the terminal window is focused by reaction to terminal focus events
+     terminal_focused: bool,
++    /// Tracks if there are prompt layers active (updated by compositor)
++    pub prompt_active: bool,
+ }
+ 
+ #[derive(Debug, Clone)]
+@@ -67,6 +69,7 @@ pub fn new(keymaps: Keymaps) -> Self {
+             completion: None,
+             spinners: ProgressSpinners::default(),
+             terminal_focused: true,
++            prompt_active: false,
+         }
+     }
+ 
+@@ -145,7 +148,7 @@ pub fn render_view(
+             if let Some(tabstops) = Self::tabstop_highlights(doc, theme) {
+                 overlays.push(tabstops);
+             }
+-            overlays.push(Self::doc_selection_highlights(
++            overlays.push(self.doc_selection_highlights(
+                 editor.mode(),
+                 doc,
+                 view,
+@@ -460,7 +463,8 @@ pub fn doc_diagnostics_highlights_into(
+     }
+ 
+     /// Get highlight spans for selections in a document view.
+-    pub fn doc_selection_highlights(
++    fn doc_selection_highlights(
++        &self,
+         mode: Mode,
+         doc: &Document,
+         view: &View,
+@@ -514,12 +518,9 @@ pub fn doc_selection_highlights(
+ 
+             // Special-case: cursor at end of the rope.
+             if range.head == range.anchor && range.head == text.len_chars() {
+-                if !selection_is_primary || (cursor_is_block && is_terminal_focused) {
+-                    // Bar and underline cursors are drawn by the terminal
+-                    // BUG: If the editor area loses focus while having a bar or
+-                    // underline cursor (eg. when a regex prompt has focus) then
+-                    // the primary cursor will be invisible. This doesn't happen
+-                    // with block cursors since we manually draw *all* cursors.
++                if !selection_is_primary || !is_terminal_focused || self.prompt_active {
++                    // Primary cursor is drawn by the terminal when focused and no prompt is active
++                    // Secondary cursors, unfocused primary cursor, and editor cursor when prompt is active are drawn manually
+                     spans.push((cursor_scope, range.head..range.head + 1));
+                 }
+                 continue;
+@@ -537,17 +538,17 @@ pub fn doc_selection_highlights(
+                         cursor_start
+                     };
+                 spans.push((selection_scope, range.anchor..selection_end));
+-                // add block cursors
+-                // skip primary cursor if terminal is unfocused - terminal cursor is used in that case
+-                if !selection_is_primary || (cursor_is_block && is_terminal_focused) {
++                // add cursors
++                // skip primary cursor if terminal is focused and no prompt is active - terminal cursor is used in that case
++                if !selection_is_primary || !is_terminal_focused || self.prompt_active {
+                     spans.push((cursor_scope, cursor_start..range.head));
+                 }
+             } else {
+                 // Reverse case.
+                 let cursor_end = next_grapheme_boundary(text, range.head);
+-                // add block cursors
+-                // skip primary cursor if terminal is unfocused - terminal cursor is used in that case
+-                if !selection_is_primary || (cursor_is_block && is_terminal_focused) {
++                // add cursors
++                // skip primary cursor if terminal is focused and no prompt is active - terminal cursor is used in that case
++                if !selection_is_primary || !is_terminal_focused || self.prompt_active {
+                     spans.push((cursor_scope, range.head..cursor_end));
+                 }
+                 // non block cursors look like they exclude the cursor
+@@ -1625,17 +1626,12 @@ fn render(&mut self, area: Rect, surface: &mut Surface, cx: &mut Context) {
+     }
+ 
+     fn cursor(&self, _area: Rect, editor: &Editor) -> (Option<Position>, CursorKind) {
+-        match editor.cursor() {
+-            // all block cursors are drawn manually
+-            (pos, CursorKind::Block) => {
+-                if self.terminal_focused {
+-                    (pos, CursorKind::Hidden)
+-                } else {
+-                    // use terminal cursor when terminal loses focus
+-                    (pos, CursorKind::Underline)
+-                }
+-            }
+-            cursor => cursor,
++        let (pos, kind) = editor.cursor();
++        if self.terminal_focused {
++            (pos, kind)
++        } else {
++            // use underline cursor when terminal loses focus for visibility
++            (pos, CursorKind::Underline)
+         }
+     }
+ }
+diff --git a/helix-term/tests/test/commands/write.rs b/helix-term/tests/test/commands/write.rs
+index 0cf09e1e..effe026f 100644
+--- a/helix-term/tests/test/commands/write.rs
++++ b/helix-term/tests/test/commands/write.rs
+@@ -746,7 +746,7 @@ async fn test_hardlink_write() -> anyhow::Result<()> {
+ async fn edit_file_with_content(file_content: &[u8]) -> anyhow::Result<()> {
+     let mut file = tempfile::NamedTempFile::new()?;
+ 
+-    file.as_file_mut().write_all(&file_content)?;
++    file.as_file_mut().write_all(file_content)?;
+ 
+     helpers::test_key_sequence(
+         &mut helpers::AppBuilder::new()
+diff --git a/helix-term/tests/test/helpers.rs b/helix-term/tests/test/helpers.rs
+index 60143aaa..52642249 100644
+--- a/helix-term/tests/test/helpers.rs
++++ b/helix-term/tests/test/helpers.rs
+@@ -61,6 +61,7 @@ pub struct TestCase {
+     pub out_text: String,
+     pub out_selection: Selection,
+ 
++    #[allow(dead_code)]
+     pub line_feed_handling: LineFeedHandling,
+ }
+ 
+@@ -425,7 +426,7 @@ pub fn reload_file(file: &mut NamedTempFile) -> anyhow::Result<()> {
+     let f = std::fs::OpenOptions::new()
+         .write(true)
+         .read(true)
+-        .open(&path)?;
++        .open(path)?;
+     *file.as_file_mut() = f;
+     Ok(())
+ }
+-- 
+2.39.5 (Apple Git-154)
+

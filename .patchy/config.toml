@@ -1,0 +1,27 @@
+repo = "helix-editor/helix"
+
+remote-branch = "master"
+
+local-branch = "patchy"
+
+pull-requests = [
+  # Scala grammar update
+  "15387",
+  
+  # Native block cursor
+  "14951",
+
+  # Preview scroll
+  "11441",
+
+  # KKP support for Zellij
+  # "14398",
+]
+
+patches = [
+  # Native block cursor
+  # "merge-13821",
+
+  # Preview scroll
+  # "merge-11441",
+]
